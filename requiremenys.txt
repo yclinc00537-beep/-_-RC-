@@ -1,3 +1,0 @@
-streamlit
-numpy
-python-docx
