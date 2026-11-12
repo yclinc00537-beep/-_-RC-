@@ -3,13 +3,24 @@ import numpy as np
 import math
 from docx import Document
 from docx.shared import Inches, Pt
-from docx.oxml import OxmlElement, parse_xml
-from docx.oxml.ns import nsdecls, qn
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
 import io
 
 # =========================================================================================
-# 1. 結構力學核心引擎 (v10.0 完全自由度活算版：全面連動三大區域獨立版厚、配筋與鋪面選單)
+# 1. 結構力學核心引擎 (v14.0 整合台灣規範最少拆模天數 + 75% fc' + 開裂剛度折減四重死線)
 # =========================================================================================
+def get_statutory_min_days(span_max, support_type, code_mode):
+    if code_mode != "自動依台灣規範 (跨距與支撐條件判定)":
+        return int(code_mode.split(" ")[1])
+    is_unshored = "無下方支撐" in support_type
+    if span_max <= 3.0:
+        return 7 if is_unshored else 4
+    elif span_max <= 6.0:
+        return 14 if is_unshored else 7
+    else:
+        return 21 if is_unshored else 14
+
 def calculate_single_case(params, case_name):
     fc = params['fc']
     fy = params['fy']
@@ -18,34 +29,29 @@ def calculate_single_case(params, case_name):
     b_beam = params['b_beam']
     h_beam = params['h_beam']
     col_w = params['col_w']
-    struct_type = params['struct_type']
     support_type = params['support_type']
     t_steel = params['t_steel']
+    min_fc_ratio = params.get('min_fc_ratio', 75) / 100.0
+    min_days_req = params.get('min_days_req', 21)
     
-    # 讀取大梁箍筋參數
     stirrup_legs = params['stirrup_legs'] 
     stirrup_no = params['stirrup_no']     
     stirrup_space = params['stirrup_space'] 
     
-    # 5大施工齡期陣列
     days = [7, 10, 14, 21, 28]
     age_pct = {7: 0.70, 10: 0.78, 14: 0.85, 21: 0.93, 28: 1.00}
     
     bar_areas = {3: 0.713, 4: 1.267}
     a_b = bar_areas.get(stirrup_no, 0.713)
+    Av = stirrup_legs * a_b
     
-    # 📢【力學引擎全解鎖】：全面讀取左側面板輸入之各分區獨立參數
     if case_name == "區域一：PC400 挖土機工作平台區 (#8@12)":
         h_case = params['h_case_1']
         d_slab = h_case - 5.5  
         w_service = (750.0 + 1700.0) / 10000.0  
         w_factored = (1.4 * 750.0 + 1.7 * 1700.0 * 1.3) / 10000.0 
-        
-        # 讀取區域一專屬主筋銷栓與暗樑剪力筋開關
-        V_dowel = params['dowel_1'] * 1000.0
         has_stirrup = params['has_stirrup_1']
         
-        # 📌【鋪面選單聯動】：依據選單彈性驅動後台應力稀釋函數與週長發育
         mode = params['deck_mode_1']
         if mode == "單鋪 2層活動覆工板 (無銲接複合效益)":
             max_share_28 = 0.0
@@ -57,7 +63,7 @@ def calculate_single_case(params, case_name):
             cover_board_bonus = 0.0
             t_cm = t_steel / 10.0
             steel_plate_info = f"PL{t_steel}mm 鋼板銲死複合斷面 (28天硬化後分擔63.4%剪力)"
-        else: # 雙重鋪面：鋼板 + 覆工板
+        else:
             max_share_28 = 0.634
             cover_board_bonus = 0.10
             t_cm = t_steel / 10.0
@@ -74,7 +80,6 @@ def calculate_single_case(params, case_name):
         
         max_share_28 = 0.50
         cover_board_bonus = 0.0
-        V_dowel = params['dowel_2'] * 1000.0
         has_stirrup = params['has_stirrup_2']
         
         t_cm = t_steel / 10.0
@@ -82,7 +87,7 @@ def calculate_single_case(params, case_name):
         Vu_beam_pure = 9.5 * 1000.0
         steel_plate_info = f"PL{t_steel}mm 鋼板 / 車道動態抗滑移剛性鋪面"
         
-    else:  # 區域三：逆打地下一般平板 (常態無施工重載區 #5@24)
+    else:
         h_case = params['h_case_3']
         d_slab = h_case - 5.0 
         w_service = (1000.0 + 350.0) / 10000.0
@@ -90,10 +95,8 @@ def calculate_single_case(params, case_name):
         
         max_share_28 = 0.0    
         cover_board_bonus = 0.0
-        V_dowel = params['dowel_3'] * 1000.0
         has_stirrup = params['has_stirrup_3']
         
-        # 邊平板三面受剪幾何折減模型
         b0_eff = (2.0 * col_w + col_w + d_slab) * 2.0  
         Vu_beam_pure = 10.5 * 1000.0
         steel_plate_info = "無 (地下常態區邊平板依 ACI 進行三面沖切折減檢核)"
@@ -102,15 +105,17 @@ def calculate_single_case(params, case_name):
     L = max(span_x, span_y) * 100.0  
     delta_limit = L / 240.0 
     
+    lambda_s = min(1.0, math.sqrt(2.0 / (1.0 + 0.04 * d_slab)))
     Vu_pure_total = w_factored * ((span_x * span_y * 10000.0) - (col_w + d_slab)**2)
 
     matrix = []
+    earliest_safe_day = None
+    
     for day in days:
         pct = age_pct[day]
         fci = fc * pct       
         Ec = 15100.0 * math.sqrt(fci)
         
-        # 早期強度硬化對複合分擔率之折減發育
         if case_name != "區域三：逆打地下一般平板 (常態無施工重載區 #5@24)":
             if day == 7:     efficiency_factor = 0.30
             elif day == 10:  efficiency_factor = 0.45
@@ -122,23 +127,31 @@ def calculate_single_case(params, case_name):
             actual_share = 0.0
             
         Vu_final_demand = Vu_pure_total * (1.0 - actual_share)
-        Vu_beam_demand = Vu_beam_pure * 0.5 if support_type == "有下方支撐傳遞 (多層連續回撐體系)" else Vu_beam_pure
+        Vu_beam_demand = Vu_beam_pure * 0.5 if "有下方支撐" in support_type else Vu_beam_pure
 
-        # 穿孔剪力因數化容量 (連動各區獨立暗樑剪力筋開關)
-        vc = 0.53 * math.sqrt(fci)
+        # ACI 318-19 穿孔剪力容量
         if has_stirrup == "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)":
+            vc = 0.53 * math.sqrt(fci)
             Vs = (Av * fy * d_slab) / float(stirrup_space)
+            Vn = vc * b0_eff * d_slab + Vs
+            Vn_max = 1.6 * math.sqrt(fci) * b0_eff * d_slab
+            if Vn > Vn_max:
+                Vn = Vn_max
+            coeff_note = "0.53√fci' + Vs"
         else:
-            Vs = 0.0
+            eff_coeff = round(1.06 * lambda_s * 0.65, 3)
+            vc = (1.06 * lambda_s * 0.65) * math.sqrt(fci)
+            Vn = vc * b0_eff * d_slab
+            coeff_note = f"1.06×λs({round(lambda_s,2)})×0.65 = {eff_coeff}√fci'"
             
-        phi_Vn = 0.75 * (vc * b0_eff * d_slab + Vs + V_dowel)
+        phi_Vn = 0.75 * Vn
         
-        # 單向大樑端部抗剪容量 (連動大梁專屬箍筋 #4@10cm)
+        # 單向大樑端部抗剪容量
         vc_beam = 0.53 * math.sqrt(fci) * b_beam * d_beam
         Vs_beam = ((2.0 * a_b) * fy * d_beam) / float(stirrup_space)
         phi_Vn_beam = 0.75 * (vc_beam + Vs_beam)
         
-        # 早期開裂與加速徐變撓度模型
+        # 早期開裂剛度折減與加速徐變撓度模型
         if day <= 10:
             ie_ratio = 0.25        
             creep_multiplier = 3.0 
@@ -153,87 +166,100 @@ def calculate_single_case(params, case_name):
         I_e = ie_ratio * (b_beam * (h_case**3) / 12.0)
         
         delta_instant = 0.0026 * (w_line * (L**4)) / (Ec * I_e)
-        if support_type == "有下方支撐傳遞 (多層連續回撐體系)":
+        if "有下方支撐" in support_type:
             delta_instant *= 0.5
             
         delta_total = delta_instant * creep_multiplier
 
+        # 四道剛性拆模解鎖門檻檢核
+        days_ok = day >= min_days_req
+        strength_ok = pct >= min_fc_ratio
         shear_ok = phi_Vn > Vu_final_demand
         beam_shear_ok = phi_Vn_beam > Vu_beam_demand
         deflection_ok = delta_total <= delta_limit
         
-        if shear_ok and beam_shear_ok and deflection_ok:
-            is_safe = "安全符合"
-            strategy = "常規拆模與回撐"
+        if days_ok and strength_ok and shear_ok and beam_shear_ok and deflection_ok:
+            is_safe = "🟢 准予拆模 (PASS)"
+            strategy = f"已滿法定 {min_days_req} 天、強度達 {int(pct*100)}% (≥{int(min_fc_ratio*100)}%) 且應力與開裂撓度全數過關，可進行分區拆模開挖。"
+            if earliest_safe_day is None:
+                earliest_safe_day = day
         else:
-            is_safe = "剛度強度不足"
+            is_safe = "🔴 禁止拆模 (NG)"
+            reasons = []
+            if not days_ok:
+                reasons.append(f"未滿法規最少養護 {min_days_req} 天限制")
+            if not strength_ok:
+                reasons.append(f"強度僅{int(pct*100)}%未達{int(min_fc_ratio*100)}%死線")
             if not shear_ok:
-                if case_name == "區域三：逆打地下一般平板 (常態無施工重載區 #5@24)":
-                    strategy = f"🔴 邊平板沖切容量不足！7d~14d邊界週長縮減，強制保留外牆側支撐土模，嚴禁提前開挖解體！"
-                else:
-                    strategy = f"🔴 ACI沖切破壞警告！早期容量({round(phi_Vn/1000.0,1)}T)低於需求({round(Vu_final_demand/1000.0,1)}T)。絕對禁止開挖下方土方！"
-            elif not beam_shear_ok:
-                strategy = f"❌ 大梁端部單向剪力容量({round(phi_Vn_beam/1000.0,1)}T)小於需求({round(Vu_beam_demand/1000.0,1)}T)！早期支座面有剪斷風險，必須立設重型回撐"
-            else:
-                strategy = f"🟡 早期下陷超規({round(delta_total,2)}cm > 限值{round(delta_limit,2)}cm)！強制大跨度下方立設重型鋼管支撐"
+                reasons.append(f"穿孔容量({round(phi_Vn/1000.0,1)}T)<需求({round(Vu_final_demand/1000.0,1)}T)")
+            if not beam_shear_ok:
+                reasons.append(f"大梁單剪({round(phi_Vn_beam/1000.0,1)}T)<需求({round(Vu_beam_demand/1000.0,1)}T)")
+            if not deflection_ok:
+                reasons.append(f"開裂徐變撓度({round(delta_total,2)}cm)>限值({round(delta_limit,2)}cm)[Ie={ie_ratio}Ig]")
+            strategy = "嚴禁拆模開挖！原因：" + "；".join(reasons) + "。維持原狀土模或滿堂回撐。"
         
         matrix.append({
             "day": day,
+            "pct_str": f"{int(pct*100)}%",
             "fci": round(fci, 1),
+            "coeff_note": coeff_note,
             "phi_Vn": round(phi_Vn / 1000.0, 1),
             "Vu": round(Vu_final_demand / 1000.0, 1), 
             "phi_Vn_beam": round(phi_Vn_beam / 1000.0, 1),
             "Vu_beam": round(Vu_beam_demand / 1000.0, 1),
-            "delta": round(delta_total, 2),
+            "delta_info": f"{round(delta_total, 2)} (Ie={ie_ratio})",
             "limit": round(delta_limit, 2),
             "status": is_safe,
             "strategy": strategy,
             "steel_info": steel_plate_info,
             "thickness": int(h_case)
         })
-    return matrix
+    return matrix, earliest_safe_day
 
 # =========================================================================
-# 2. Word 報告書自動化產出引擎 (儲存格 Tuple 絕對指定寫入)
-# =========================================================================
+# 2. Word 報告書自動化產出引擎
+# =========================================================================================
 def set_cell_background(cell, color_hex):
     shading_elm = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
     cell._tc.get_or_add_tcPr().append(shading_elm)
 
-def generate_cumulative_word_report(params, all_cases_data):
+def generate_cumulative_word_report(params, all_cases_results):
     doc = Document()
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Microsoft JhengHei'
-    font.size = Pt(11)
+    font.size = Pt(10.5)
     
     title = doc.add_paragraph()
-    run = title.add_run("逆打施工平台與地下平板結構拆模多層區綜合核算報告書")
+    run = title.add_run("逆打施工平台與地下平板結構拆模時間綜合核算報告書")
     run.font.size = Pt(18)
     run.font.bold = True
     title.alignment = 1
     
-    doc.add_heading("一、 結構工程基礎設計參數明細", level=2)
+    doc.add_heading("一、 結構工程基礎設計與拆模管制參數明細", level=2)
     table_in = doc.add_table(rows=1, cols=2)
     table_in.style = 'Table Grid'
     
     cell_title_l = table_in.cell(0, 0)
     cell_title_r = table_in.cell(0, 1)
-    
     cell_title_l.paragraphs[0].add_run('基本工程參數項目').font.bold = True
     cell_title_r.paragraphs[0].add_run('設計規範數值').font.bold = True
     set_cell_background(cell_title_l, "4F81BD")
     set_cell_background(cell_title_r, "4F81BD")
         
+    min_ratio = params.get('min_fc_ratio', 75)
+    min_days = params.get('min_days_req', 21)
     inputs_list = [
         ("混凝土設計強度 fc'", f"{params['fc']} kgf/cm²"),
+        ("法定最少拆模養護時間", f"{min_days} 天（依台灣施工規範跨距與支撐條件判定）"),
+        ("法定最低拆模強度門檻", f"{min_ratio}% fc' ({round(params['fc']*min_ratio/100.0, 1)} kgf/cm²)"),
         ("鋼筋屈服強度 fy", f"{params['fy']} kgf/cm²"),
         ("樓版淨幾何長寬", f"{params['span_x']} m × {params['span_y']} m"),
         ("四週外圍大樑尺寸", f"{params['b_beam']} cm × {params['h_beam']} cm"),
         ("柱頭方形核心尺寸", f"{params['col_w']} cm × {params['col_w']} cm"),
-        ("區域一(PC400)設定版厚", f"{params['h_case_1']} cm"),
-        ("區域二(土車道)設定版厚", f"{params['h_case_2']} cm"),
-        ("區域三(常態室)設定版厚", f"{params['h_case_3']} cm"),
+        ("區域一(PC400)設定版厚", f"{params['h_case_1']} cm ({params['has_stirrup_1']})"),
+        ("區域二(土車道)設定版厚", f"{params['h_case_2']} cm ({params['has_stirrup_2']})"),
+        ("區域三(常態室)設定版厚", f"{params['h_case_3']} cm ({params['has_stirrup_3']})"),
         ("外圍大樑專屬 Stirrups 配置", f"{params['stirrup_legs']}支 - #{params['stirrup_no']} @ {params['stirrup_space']} cm")
     ]
     
@@ -243,44 +269,48 @@ def generate_cumulative_word_report(params, all_cases_data):
         row_cells[1].text = item[1]
         
     doc.add_paragraph("\n")
-    doc.add_heading("二、 各施工分區與荷載狀況累加檢核矩陣", level=2)
+    doc.add_heading("二、 各施工分區拆模時間與多齡期核算矩陣", level=2)
     
-    for case_name, matrix in all_cases_data.items():
-        doc.add_heading(f"分區項目: {case_name}", level=3)
+    for case_name, (matrix, earliest_day) in all_cases_results.items():
+        day_str = f"最早可安全拆模時間：【第 {earliest_day} 天】" if earliest_day else "【28天內均未達標，必須維持滿堂回撐】"
+        doc.add_heading(f"分區項目: {case_name} ── {day_str}", level=3)
         table_out = doc.add_table(rows=1, cols=10)
         table_out.style = 'Table Grid'
-        headers = ["分區版厚", "齡期", "強度\n(fci')", "穿孔剪力\n容量/需求(T)", "大梁剪力\n容量/需求(T)", "長期撓度\n(cm)", "法規限值\n(L/240)", "安全判定", "建議對策", "表面鋼板與錨碇配置"]
+        headers = ["版厚", "齡期\n(強度比)", "預估強度\n(fci')", "抗剪係數修正\n(ACI 318-19)", "穿孔剪力\n容量/需求(T)", "大梁剪力\n容量/需求(T)", "總撓度(cm)\n(開裂剛度)", "限值\n(L/240)", "拆模判定", "施工管制與對策"]
         
         for i, title_text in enumerate(headers):
             target_cell = table_out.cell(0, i)
             run_out = target_cell.paragraphs[0].add_run(title_text)
             run_out.font.bold = True
-            run_out.font.size = Pt(9.5)
+            run_out.font.size = Pt(8.5)
             set_cell_background(target_cell, "366092")
         for item in matrix:
             row_cells = table_out.add_row().cells
             row_cells[0].text = f"{item['thickness']} cm"
-            row_cells[1].text = f"{item['day']}天"
+            row_cells[1].text = f"{item['day']}天\n({item['pct_str']})"
             row_cells[2].text = f"{item['fci']}"
-            row_cells[3].text = f"{item['phi_Vn']} / {item['Vu']}"
-            row_cells[4].text = f"{item['phi_Vn_beam']} / {item['Vu_beam']}"
-            row_cells[5].text = f"{item['delta']}"
-            row_cells[6].text = f"{item['limit']}"
-            row_cells[7].text = item['status']
-            row_cells[8].text = item['strategy']
-            row_cells[9].text = item['steel_info']
+            row_cells[3].text = item['coeff_note']
+            row_cells[4].text = f"{item['phi_Vn']} / {item['Vu']}"
+            row_cells[5].text = f"{item['phi_Vn_beam']} / {item['Vu_beam']}"
+            row_cells[6].text = item['delta_info']
+            row_cells[7].text = f"{item['limit']}"
+            row_cells[8].text = item['status']
+            row_cells[9].text = item['strategy']
             
-            if "不足" in item['status']:
+            if "禁止" in item['status']:
                 for cell in row_cells:
                     set_cell_background(cell, "FDE9D9")
+            else:
+                for cell in row_cells:
+                    set_cell_background(cell, "EBF1DE")    
         doc.add_paragraph()
         
-    doc.add_heading("三、 ACI 318 與 AISC 綜合品管管制死線說明", level=2)
-    doc.add_paragraph(
-        f"""1. 本案依據最終核定之全區版厚與幾何進行精密核算。重載平台採取指定之複合鋪面分擔率與邊樑 #4@10cm 強大端部箍筋。28天期混凝土硬化達100%時，系統將完全隨您輸入之各區版筋與剪力筋幾何實時活算。
-2. 唯在養護 7天 與 14天 早期階段時，受限於低強度基材與邊平板區週長縮減缺陷，系統依舊剛性跳出紅燈警告。計畫書強制規定：混凝土養護未確實滿 21~28 天且強度未達 100% 之前，平台下方土模及邊界連續壁側櫬墊絕對禁止進行任何盲目掏空或解體拆模，維持原狀土模完全承壓效果，確保逆打全生命週期之安全。
-3. 現場硬開機解鎖死線必須以現場同條件養護試體實際壓驗報告為唯一憑證，嚴禁未達標盲目施工。"""
-    )
+        doc.add_heading("三、 拆模時間雙軌解鎖與品管管制死線說明", level=2)
+        doc.add_paragraph(
+            f"""1. 本系統嚴格整合四道拆模解鎖死線：(1) 養護齡期必須達到台灣施工規範最少拆模天數（本案判定為 {min_days} 天）；(2) 混凝土抗壓強度必須達到設計強度之 {min_ratio}% 以上；(3) ACI 318-19 尺寸效應 λs 與施工偏載 0.65 折減後之穿孔與單向抗剪容量大於需求；(4) 計入早期開裂慣性矩折減（7~10天 Ie=0.25Ig、14天 Ie=0.45Ig）與加速徐變後之總撓度小於 L/240 限值。
+            2. 未同時滿足上述四道門檻前，平台下方土模及邊界連續壁側櫬墊絕對禁止盲目掏空或解體拆模。
+            3. 現場實際拆模解鎖必須以同條件養護試體抗壓試驗報告與監測數據為唯一憑證，經結構技師核可後方得施作。"""
+        )
     
     bio = io.BytesIO()
     doc.save(bio)
@@ -290,19 +320,28 @@ def generate_cumulative_word_report(params, all_cases_data):
 # ==========================================
 # 3. Streamlit 使用者前端網頁介面 (UI Window)
 # ==========================================
-st.set_page_config(page_title="逆打施工平台多分區綜合分析APP", layout="wide")
+st.set_page_config(page_title="逆打施工平台拆模時間綜合分析APP", layout="wide")
 
-st.title("逆打施工平台與地下平板 ACI 多狀況累加自動化系統")
+st.title("逆打施工平台與地下平板 ACI 318-19 拆模時間自動化系統")
 st.write(
-    """本系統已升級為【v10.0 全自由度活算版】。
-全面開放左側面板之三大分區獨立版厚、主筋銷栓噸數、暗樑剪力筋開關，並於區域一正式增設複合鋪面形式下拉選單控制核心。"""
+    """本系統已升級為【v14.0 台灣規範最少拆模時間完全合規版】。
+    全面整合「規範最少拆模天數限制」、「75% fc' 強度死線」、「應力安全門檻」與「早期開裂剛度折減（Ie=0.25~0.45Ig）及加速徐變撓度限制」，自動推算各區最早可安全拆模天數。"""
 )
 
-st.sidebar.header("結構工程輸入參數矩陣面版")
+st.sidebar.header("結構工程與拆模管制參數面版")
 
 # 📌 區域一特化鋪面下拉選單
-st.sidebar.subheader("--- 區域一 (PC400區) 專屬鋪面選單 ---")
-deck_mode_1 = st.sidebar.selectbox("區域一複合鋪面型式", [
+st.sidebar.subheader("--- 規範最少拆模時間與強度門檻 ---")
+code_days_mode = st.sidebar.selectbox("法規最少拆模天數限制", [
+"自動依台灣規範 (跨距與支撐條件判定)",
+"強制 7 天 (短跨度或有連續回撐)",
+"強制 14 天 (中跨度或有連續回撐)",
+"強制 21 天 (大跨度 >6m 且逆打懸空無支撐)"
+], index=0)
+
+min_fc_ratio = st.sidebar.slider("法定最低拆模強度門檻 (% fc')", 70, 100, 75, step=5)
+
+deck_mode_1 = st.sidebar.selectbox("區域一(PC400區)複合鋪面型式", [
     "單鋪 2層活動覆工板 (無銲接複合效益)",
     "單鋪 PL12mm 鋼板 (全面銲死錨碇複合斷面)",
     "PL12mm 鋼板銲死 + 2層活動覆工板 (最高規格雙重防線)"
@@ -316,30 +355,22 @@ stirrup_space = st.sidebar.selectbox("C. 大梁箍筋綁紮間距 (Spacing cm)",
 # 📌 開放三大分區獨立版厚、配筋銷栓與剪力筋聯動選單
 st.sidebar.subheader("--- 區域一：挖土機區獨立變數 ---")
 h_case_1 = st.sidebar.slider("1-A. 區域一 樓版厚度 (cm)", 20, 50, 30)
-dowel_1 = st.sidebar.selectbox("1-B. #8@12cm 主筋銷栓抗剪貢獻 (T)", [0.0, 5.0, 10.0, 15.0, 20.0], index=3)
-has_stirrup_1 = st.sidebar.selectbox("1-C. 區域一 版內暗樑剪力補強", ["無版內剪力筋 (純混凝土受沖切)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_1 = st.sidebar.selectbox("1-B. 區域一 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 區域二：土車行駛區獨立變數 ---")
 h_case_2 = st.sidebar.slider("2-A. 區域二 樓版厚度 (cm)", 20, 50, 25)
-dowel_2 = st.sidebar.selectbox("2-B. #5@10cm 主筋銷栓抗剪貢獻 (T)", [0.0, 5.0, 8.0, 12.0], index=2)
-has_stirrup_2 = st.sidebar.selectbox("2-C. 區域二 版內暗樑剪力補強", ["無版內剪力筋 (純混凝土受沖切)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_2 = st.sidebar.selectbox("2-B. 區域二 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 區域三：常態地下室獨立變數 ---")
 h_case_3 = st.sidebar.slider("3-A. 區域三 樓版厚度 (cm)", 20, 60, 40)
-dowel_3 = st.sidebar.selectbox("3-B. #5@24cm 主筋銷栓抗剪貢獻 (T)", [0.0, 3.0, 5.0], index=0)
-has_stirrup_3 = st.sidebar.selectbox("3-C. 區域三 版內暗樑剪力補強", ["無版內剪力筋 (純混凝土受沖切)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_3 = st.sidebar.selectbox("3-B. 區域三 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 基礎材料與幾何參數 ---")
 t_steel = st.sidebar.selectbox("1. 鋪設鋼板基本厚度 PL (mm)", [12, 16, 19, 22], index=0)
 fc = st.sidebar.selectbox("2. 混凝土 28天設計強度 fc' (kgf/cm²)", [280, 350, 420], index=1)
 fy = st.sidebar.selectbox("3. 鋼筋屈服強度 fy (kgf/cm²)", [2800, 4200], index=1)
 
-struct_type = st.sidebar.selectbox("4. 結構構件型式分類", [
-    "平板結構 (有柱列暗樑與單根#3剪力筋)", 
-    "有樑板結構 (由大主梁主導受剪)"
-], index=0)
-
-support_type = st.sidebar.selectbox("5. 施工支撐壓力傳遞模式", [
+support_type = st.sidebar.selectbox("4. 施工支撐壓力傳遞模式", [
     "逆打工法完全懸空模式 (無下方支撐/傳遞)", 
     "有下方支撐傳遞 (多層連續回撐體系)"
 ], index=0)
@@ -354,16 +385,21 @@ with col2:
 
 col_w = st.sidebar.number_input("柱頭方形尺寸 (cm)", value=90.0, step=5.0)
 
+span_max = max(span_x, span_y)
+min_days_req = get_statutory_min_days(span_max, support_type, code_days_mode)
+st.sidebar.info(f"📌 依目前跨距 ({span_max}m) 與支撐條件，台灣施工規範最少拆模天數為：【{min_days_req} 天】")
+
 params = {
     'fc': fc, 'fy': fy, 'span_x': span_x, 'span_y': span_y,
     'b_beam': b_beam, 'h_beam': h_beam, 'col_w': col_w,
-    'struct_type': struct_type, 'support_type': support_type,
-    't_steel': t_steel, 'stirrup_legs': stirrup_legs,
-    'stirrup_no': stirrup_no, 'stirrup_space': stirrup_space,
+    'support_type': support_type, 't_steel': t_steel, 
+    'min_fc_ratio': min_fc_ratio,
+    'min_days_req': min_days_req,
+    'stirrup_legs': stirrup_legs, 'stirrup_no': stirrup_no, 'stirrup_space': stirrup_space,
     'deck_mode_1': deck_mode_1,
-    'h_case_1': h_case_1, 'dowel_1': dowel_1, 'has_stirrup_1': has_stirrup_1,
-    'h_case_2': h_case_2, 'dowel_2': dowel_2, 'has_stirrup_2': has_stirrup_2,
-    'h_case_3': h_case_3, 'dowel_3': dowel_3, 'has_stirrup_3': has_stirrup_3
+    'h_case_1': h_case_1, 'has_stirrup_1': has_stirrup_1,
+    'h_case_2': h_case_2, 'has_stirrup_2': has_stirrup_2,
+    'h_case_3': h_case_3, 'has_stirrup_3': has_stirrup_3
 }
 
 cases_list = [
@@ -376,22 +412,27 @@ all_cases_results = {}
 for case in cases_list:
     all_cases_results[case] = calculate_single_case(params, case)
 
-for case_name, matrix in all_cases_results.items():
-    st.subheader(f"分析分區: {case_name} — ACI 多齡期核算矩陣")
+# 📌【核心修正】：正確解包 (matrix, earliest_day)，徹底消除 NameError
+for case_name, (matrix, earliest_day) in all_cases_results.items():
+    st.subheader(f"分析分區: {case_name}")
+    if earliest_day:
+        st.success(f"⏱️ 系統精算建議：本區最早可安全拆模（開挖）時間為【第 {earliest_day} 天】（已滿足規範最少 {min_days_req} 天、強度 ≥ {min_fc_ratio}% fc'、抗剪應力與開裂撓度四道死線）")
+    else:
+        st.error("⚠️ **系統精算警告：本區在 28 天內均未同時滿足強度與開裂撓度死線，必須維持原狀土模或立設滿堂重型回撐！**")
     
     display_data = []
     for r in matrix:
         display_data.append({
-            "分區版厚": f"{r['thickness']} cm",
-            "施工齡期": f"{r['day']} 天",
-            "預估強度(kgf/cm²)": r['fci'],
+            "版厚": f"{r['thickness']} cm",
+            "齡期 (強度比)": f"{r['day']} 天 ({r['pct_str']})",
+            "預估強度 (kgf/cm²)": r['fci'],
+            "抗剪係數修正 (ACI 318-19)": r['coeff_note'],
             "穿孔剪力 容量/需求 (T)": f"{r['phi_Vn']} / {r['Vu']}",
-            "大梁單向剪力 容量/需求 (T)": f"{r['phi_Vn_beam']} / {r['Vu_beam']}",
-            "長期總累計撓度 (cm)": r['delta'],
-            "法規撓度限值 L/240 (cm)": r['limit'],
-            "結構安全判定": r['status'],
-            "建議輔助與支撐管理對策": r['strategy'],
-            "表面鋼板與錨碇配置": r['steel_info']
+            "大梁單剪 容量/需求 (T)": f"{r['phi_Vn_beam']} / {r['Vu_beam']}",
+            "總撓度(cm) [開裂剛度]": r['delta_info'],
+            "限值 L/240": r['limit'],
+            "拆模判定": r['status'],
+            "施工管制與未達標原因說明": r['strategy']
         })
     st.table(display_data)
 
@@ -399,9 +440,9 @@ st.subheader("綜合申報書一鍵匯出面版")
 word_file = generate_cumulative_word_report(params, all_cases_results)
 
 st.download_button(
-    label="導出【三大區域合併累加】標準 Word 報告書 (.docx)",
+    label="導出【三大區域拆模時間與多齡期核算】標準 Word 報告書 (.docx)",
     data=word_file,
-    file_name="ACI_Multi_Case_Cumulative_Report.docx",
+    file_name="ACI_318_19_Formwork_Removal_Report.docx",
     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     key="fixed_final_download_key_panel"
 )
