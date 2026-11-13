@@ -8,11 +8,11 @@ from docx.oxml.ns import nsdecls
 import io
 
 # =========================================================================================
-# 1. 結構力學核心引擎 (v16.0 支援矩形柱/圓柱幾何切換 + 縱向鋼筋 #4~#6 @10~20 連動)
+# 1. 結構力學核心引擎 (v17.0 ACI 318-19 完整規範定案版)
 # =========================================================================================
 def get_statutory_min_days(span_max, support_type, code_mode):
     if code_mode != "自動依台灣規範 (跨距與支撐條件判定)":
-        return int(code_mode.split(" ")[1])
+        return int(code_mode.split(" "))
     is_unshored = "無下方支撐" in support_type
     if span_max <= 3.0:
         return 7 if is_unshored else 4
@@ -33,7 +33,7 @@ def calculate_single_case(params, case_name):
     min_fc_ratio = params.get('min_fc_ratio', 75) / 100.0
     min_days_req = params.get('min_days_req', 21)
     
-    # 讀取縱向鋼筋參數 (#4~#6, @10~20)
+    # 讀取縱向鋼筋參數 (#4~#8, @10~20)
     long_bar_no = params['long_bar_no']
     long_bar_space = params['long_bar_space']
     bar_areas_all = {3: 0.713, 4: 1.267, 5: 1.986, 6: 2.865, 7: 3.871, 8: 5.067}
@@ -57,7 +57,6 @@ def calculate_single_case(params, case_name):
     a_b = bar_areas_all.get(stirrup_no, 1.267)
     Av = stirrup_legs * a_b
     
-    # 計算柱頭高寬比 beta_col (ACI 318-19 Table 22.6.5.2)
     if col_shape == "矩形柱 (b × d)":
         beta_col = max(col_b, col_d) / min(col_b, col_d)
     else:
@@ -118,22 +117,19 @@ def calculate_single_case(params, case_name):
         Vu_beam_pure = 10.5 * 1000.0
         steel_plate_info = "無 (地下常態區邊平板依 ACI 318-19 αs=30 進行三面沖切折減檢核)"
 
-    # 📌【柱頭臨界週長 b0 與核心面積計算 (支援矩形 b×d 與圓柱直徑 D)】
+    # 柱頭臨界週長 b0 與核心面積計算 (支援矩形 b×d 與圓柱直徑 D)
     if col_shape == "矩形柱 (b × d)":
         c1_eff = col_b + 2.0 * t_cm + d_slab
         c2_eff = col_d + 2.0 * t_cm + d_slab
         if case_name == "區域三：逆打地下一般平板 (常態無施工重載區)":
-            # 邊柱三面受剪模型 (假設長邊 col_d 靠外牆)
             b0_eff = 2.0 * (col_b + d_slab / 2.0) + (col_d + d_slab)
             core_area_cm2 = (col_b + d_slab / 2.0) * (col_d + d_slab)
         else:
             b0_eff = 2.0 * (c1_eff + c2_eff)
             core_area_cm2 = (col_b + d_slab) * (col_d + d_slab)
     else:
-        # 圓柱直徑 D 模型
         d_eff_circle = col_dia + 2.0 * t_cm + d_slab
         if case_name == "區域三：逆打地下一般平板 (常態無施工重載區)":
-            # 邊圓柱約取 65% 有效圓周受剪
             b0_eff = math.pi * (col_dia + d_slab) * 0.65
             core_area_cm2 = (math.pi / 4.0) * ((col_dia + d_slab) ** 2) * 0.65
         else:
@@ -144,10 +140,17 @@ def calculate_single_case(params, case_name):
     L = max(span_x, span_y) * 100.0  
     delta_limit = L / 240.0 
     
-    lambda_s_slab = min(1.0, math.sqrt(2.0 / (1.0 + 0.04 * d_slab)))
-    lambda_s_beam = min(1.0, math.sqrt(2.0 / (1.0 + 0.04 * d_beam)))
+    # ACI 318-19 尺寸效應折減係數 λs (臨界深度 d = 25 cm)
+    if d_slab <= 25.0:
+        lambda_s_slab = 1.0
+        size_effect_tag = f"d={d_slab}≤25cm(λs=1.0無折減)"
+    else:
+        lambda_s_slab = math.sqrt(2.0 / (1.0 + 0.04 * d_slab))
+        size_effect_tag = f"d={d_slab}>25cm(λs={round(lambda_s_slab,3)}折減)"
+        
+    lambda_s_beam = 1.0 if d_beam <= 25.0 else math.sqrt(2.0 / (1.0 + 0.04 * d_beam))
     
-    # 依據縱向鋼筋選單換算受拉鋼筋比 ρw (連動 ACI 318-19 單向剪力)
+    # 依據縱向鋼筋選單換算受拉鋼筋比 ρw
     rho_w_slab = As_per_meter / (100.0 * d_slab)
     rho_w_beam = max(0.008, min(0.025, rho_w_slab * 1.15))
     
@@ -183,7 +186,7 @@ def calculate_single_case(params, case_name):
             Vn_max = 1.6 * math.sqrt(fci) * b0_eff * d_slab
             if Vn > Vn_max:
                 Vn = Vn_max
-            coeff_note = f"ACI-19: 0.53×λs({round(lambda_s_slab,2)})√fci' + Vs"
+            coeff_note = f"ACI-19: 0.53×{size_effect_tag}√fci' + Vs"
         else:
             vc_1 = 1.06 * lambda_s_slab * math.sqrt(fci)
             vc_2 = 0.53 * (1.0 + 2.0 / beta_col) * lambda_s_slab * math.sqrt(fci)
@@ -193,11 +196,11 @@ def calculate_single_case(params, case_name):
             vc = vc_aci19_base * 0.65
             Vn = vc * b0_eff * d_slab
             eff_k = round((vc / math.sqrt(fci)), 3)
-            coeff_note = f"ACI-19(β={round(beta_col,2)})×λs({round(lambda_s_slab,2)})×0.65 = {eff_k}√fci'"
+            coeff_note = f"ACI-19(β={round(beta_col,2)})×{size_effect_tag}×0.65 = {eff_k}√fci'"
             
         phi_Vn = 0.75 * Vn
         
-        # 📌【ACI 318-19 Table 22.5.5.1 單向大樑端部抗剪容量 (依臨界深度 d_crit 取大值或小值)】
+        # ACI 318-19 Table 22.5.5.1 單向大樑端部抗剪容量 (依臨界深度 d_crit 取大值或小值)
         Av_beam = 2.0 * a_b
         d_crit_beam = 800.0 * (rho_w_beam ** (2.0 / 3.0)) - 25.0
         
@@ -209,7 +212,6 @@ def calculate_single_case(params, case_name):
         else:
             vc_beam_stress = min(vc_trad, vc_aci19)
             
-        # 依據 ACI 318-19 規定，混凝土單向抗剪應力上限為 1.33 * sqrt(fci')
         vc_beam_stress = min(vc_beam_stress, 1.33 * math.sqrt(fci))
             
         vc_beam = vc_beam_stress * b_beam * d_beam
@@ -386,8 +388,8 @@ def generate_cumulative_word_report(params, all_cases_results):
         doc.add_heading("三、 ACI 318-19 抗剪規範與四重拆模死線說明", level=2)
         doc.add_paragraph(
             f"""1. 混凝土抗剪強度計算全面遵循 ACI 318-19 現行規範：
-            (1) 雙向穿孔剪力（Table 22.6.5.2）：無剪力筋時取三式最小值（含柱頭高寬比 β、臨界斷面常數 αs 及尺寸效應係數 λs = √(2/(1+0.04d)) ≤ 1.0），並考量施工偏載與早期開裂乘上 0.65 保守折減；有剪力筋時採用 0.53·λs·√fci' + Vs。
-             (2) 單向大梁剪力（Table 22.5.5.1）：依縱向鋼筋選單（#{params['long_bar_no']}@{params['long_bar_space']}cm）換算受拉鋼筋比 ρw，並計算臨界深度 d_crit = 800·(ρw)^(2/3) - 25；當有效深度 d ≤ d_crit 時，Vc 取 max(0.53√fci', 2.12·λs·ρw^(1/3)·√fci')，反之取 min 兩者之小值（上限 1.33√fci'）再疊加箍筋容量 Vs。
+            (1) 雙向穿孔剪力（Table 22.6.5.2）：無剪力筋時取三式最小值（含柱頭高寬比 β、臨界斷面常數 αs），並依 ACI 318-19 臨界有效深度 d = 25 cm 檢核尺寸效應係數 λs = √(2/(1+0.04d)) ≤ 1.0（當 d ≤ 25 cm 時取上限 λs = 1.0 不受折減；當 d > 25 cm 如 40 cm 厚版時，λs < 1.0 隨深度持續向下折減），再考量施工偏載與早期開裂乘上 0.65 保守折減；有剪力筋時採用 0.53·λs·√fci' + Vs。
+            (2) 單向大梁剪力（Table 22.5.5.1）：依縱向鋼筋選單（#{params['long_bar_no']}@{params['long_bar_space']}cm）換算受拉鋼筋比 ρw，並計算臨界深度 d_crit = 800·(ρw)^(2/3) - 25；當有效深度 d ≤ d_crit 時，Vc 取 max(0.53√fci', 2.12·λs·ρw^(1/3)·√fci')，反之取 min 兩者之小值（上限 1.33√fci'）再疊加箍筋容量 Vs。
             2. 四道拆模解鎖死線：(1) 養護齡期達台灣施工規範最少 {min_days} 天；(2) 混凝土抗壓強度達設計強度之 {min_ratio}% 以上；(3) ACI 318-19 抗剪容量大於需求；(4) 計入早期開裂慣性矩折減（Ie=0.25~0.45Ig）與加速徐變後之總撓度小於 L/240 限值。
             3. 現場實際拆模解鎖必須以同條件養護試體抗壓試驗報告與監測數據為唯一憑證，經結構技師核可後方得施作。"""
         )
@@ -404,8 +406,8 @@ st.set_page_config(page_title="逆打施工平台拆模時間綜合分析APP (AC
 
 st.title("逆打施工平台與地下平板 ACI 318-19 拆模時間自動化系統")
 st.write(
-    """本系統已升級為【v16.0 柱頭雙幾何 & 縱向鋼筋全聯動版】。
-    新增縱向鋼筋選單（#4 ~ #6, @10 ~ 20 cm），並支援矩形柱（b × d）與圓柱（直徑 D）兩種柱頭幾何精算模型。"""
+    """本系統已升級為【v17.0 ACI 318-19 完整規範定案版】。
+    完整整合「雙向穿孔 d=25cm 尺寸效應判定」、「單向大梁 d_crit 臨界深度判定」、「矩形／圓柱幾何切換」與「#4~#8 縱向主筋連動」。"""
 )
 
 st.sidebar.header("結構工程與拆模管制參數面版")
@@ -452,15 +454,15 @@ else:
 # 📌 開放三大分區獨立版厚、配筋銷栓與剪力筋聯動選單
 st.sidebar.subheader("--- 區域一：挖土機區獨立變數 ---")
 h_case_1 = st.sidebar.slider("1-A. 區域一 樓版厚度 (cm)", 20, 50, 30)
-has_stirrup_1 = st.sidebar.selectbox("1-B. 區域一 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_1 = st.sidebar.selectbox("1-B. 區域一 版內暗樑剪力補強", ["無版內剪力筋 (ACI 318-19 Table 22.6.5.2)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 區域二：土車行駛區獨立變數 ---")
 h_case_2 = st.sidebar.slider("2-A. 區域二 樓版厚度 (cm)", 20, 50, 25)
-has_stirrup_2 = st.sidebar.selectbox("2-B. 區域二 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_2 = st.sidebar.selectbox("2-B. 區域二 版內暗樑剪力補強", ["無版內剪力筋 (ACI 318-19 Table 22.6.5.2)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 區域三：常態地下室獨立變數 ---")
 h_case_3 = st.sidebar.slider("3-A. 區域三 樓版厚度 (cm)", 20, 60, 40)
-has_stirrup_3 = st.sidebar.selectbox("3-B. 區域三 版內暗樑剪力補強", ["無版內剪力筋 (1.06×λs×0.65 ≈ 0.69√fc')", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
+has_stirrup_3 = st.sidebar.selectbox("3-B. 區域三 版內暗樑剪力補強", ["無版內剪力筋 (ACI 318-19 Table 22.6.5.2)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
 st.sidebar.subheader("--- 基礎材料與幾何參數 ---")
 t_steel = st.sidebar.selectbox("1. 鋪設鋼板基本厚度 PL (mm)", [12, 16, 19, 22], index=0)
