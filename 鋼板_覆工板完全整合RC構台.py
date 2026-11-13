@@ -8,7 +8,7 @@ from docx.oxml.ns import nsdecls
 import io
 
 # =========================================================================================
-# 1. 結構力學核心引擎 (v18.0 全參數動態連動版：ACI 318-19 Bischoff 開裂剛度 + 板/梁雙單剪)
+# 1. 結構力學核心引擎 (v19.1 ACI 318-19 完整規範 + 施工變數與不規則模型保守調校版)
 # =========================================================================================
 def get_statutory_min_days(span_max, support_type, code_mode):
     if code_mode != "自動依台灣規範 (跨距與支撐條件判定)":
@@ -32,6 +32,10 @@ def calculate_single_case(params, case_name):
     t_steel = params['t_steel']
     min_fc_ratio = params.get('min_fc_ratio', 75) / 100.0
     min_days_req = params.get('min_days_req', 21)
+    
+    # 讀取撓度保守調校參數
+    k_irr_heavy = params.get('k_irr_heavy', 1.50)
+    alpha_slab_semi = params.get('alpha_slab_semi', 0.0032)
     
     # 讀取縱向鋼筋參數 (#4~#8, @10~20)
     long_bar_no = params['long_bar_no']
@@ -60,12 +64,11 @@ def calculate_single_case(params, case_name):
     
     beta_col = (max(col_b, col_d) / min(col_b, col_d)) if col_shape == "矩形柱 (b × d)" else 1.0
     
-    # 📌【動態自重與荷重設定】：隨各區版厚 h_case 即時計算靜載重 (24 kgf/m²/cm + 100模板雜項)
     if case_name == "區域一：PC400 挖土機工作平台區":
         h_case = params['h_case_1']
         d_slab = h_case - 5.5
         w_dead = 24.0 * h_case + 100.0
-        w_live = 1700.0 * 1.3  # 含動態衝擊係數 1.3
+        w_live = 1700.0 * 1.3
         has_stirrup = params['has_stirrup_1']
         alpha_s = 40.0
         
@@ -90,7 +93,7 @@ def calculate_single_case(params, case_name):
         h_case = params['h_case_2']
         d_slab = h_case - 5.0
         w_dead = 24.0 * h_case + 100.0
-        w_live = 1250.0 * 1.3  # 含動態衝擊係數 1.3
+        w_live = 1250.0 * 1.3
         alpha_s = 40.0
         
         max_share_28 = 0.50
@@ -103,7 +106,7 @@ def calculate_single_case(params, case_name):
         h_case = params['h_case_3']
         d_slab = h_case - 5.0
         w_dead = 24.0 * h_case + 100.0
-        w_live = 350.0         # 常態施工活載重
+        w_live = 350.0
         alpha_s = 30.0
         
         max_share_28 = 0.0    
@@ -112,7 +115,6 @@ def calculate_single_case(params, case_name):
         t_cm = 0.0
         steel_plate_info = "無 (地下常態區邊平板依 ACI 318-19 αs=30 進行三面沖切折減檢核)"
 
-    # 換算均佈使用荷重與因數化設計荷重 (kgf/cm²)
     w_service = (w_dead + w_live) / 10000.0
     w_factored = (1.4 * w_dead + 1.7 * w_live) / 10000.0
 
@@ -138,9 +140,7 @@ def calculate_single_case(params, case_name):
     d_beam = h_beam - 8.0
     L_long = max(span_x, span_y) * 100.0
     L_short = min(span_x, span_y) * 100.0
-    delta_limit = L_long / 240.0
     
-    # ACI 318-19 尺寸效應折減係數 λs
     if d_slab <= 25.0:
         lambda_s_slab = 1.0
         size_effect_tag = f"d={d_slab}≤25cm(λs=1.0)"
@@ -150,7 +150,6 @@ def calculate_single_case(params, case_name):
         
     lambda_s_beam = 1.0 if d_beam <= 25.0 else math.sqrt(2.0 / (1.0 + 0.04 * d_beam))
     
-    # 受拉鋼筋比 ρw
     rho_w_slab = As_per_meter / (100.0 * d_slab)
     rho_w_beam = max(0.008, min(0.025, rho_w_slab * 1.15))
     
@@ -158,23 +157,19 @@ def calculate_single_case(params, case_name):
     net_tributary_cm2 = max(10000.0, (span_x * span_y * 10000.0) - core_area_cm2)
     Vu_pure_total = w_factored * net_tributary_cm2
 
-    # 2. 樓版單向剪力需求 (1m 寬短向版帶，距梁邊 d_slab 處臨界斷面)
+    # 2. 樓版單向剪力需求 (1m 寬短向版帶)
     clear_span_short = max(100.0, L_short - b_beam)
     Vu_slab_1way_demand = w_factored * 100.0 * max(0.0, (clear_span_short / 2.0) - d_slab)
 
-    # 3. 外圍大梁單向剪力需求 (梯形負擔面積 + 大梁自重，距柱面 d_beam 處臨界斷面)
-    # 梯形等效均佈寬度 w_eq = w_factored * (L_short / 2) * (1 - L_short / (2 * L_long))
+    # 3. 外圍大梁單向剪力需求 (梯形負擔面積 + 大梁自重)
     w_trib_beam = w_factored * (L_short / 2.0) * (1.0 - (L_short / (2.0 * L_long)))
-    w_beam_self_factored = 1.4 * (2400.0 * (b_beam / 100.0) * (h_beam / 100.0)) / 100.0  # kgf/cm
+    w_beam_self_factored = 1.4 * (2400.0 * (b_beam / 100.0) * (h_beam / 100.0)) / 100.0
     w_beam_total_line = w_trib_beam + w_beam_self_factored
     Vu_beam_pure = w_beam_total_line * max(0.0, (L_long / 2.0) - (col_equiv_w / 2.0) - d_beam)
 
-    # 樓版毛慣性矩 Ig (100cm 寬版帶) 與使用彎矩 Ma
     Ig_slab = 100.0 * (h_case ** 3) / 12.0
     yt_slab = h_case / 2.0
-    # 雙向連續版短向跨中/支承等效彎矩係數 α ≈ 0.065
-    Ma_slab = 0.065 * (w_service * 100.0) * (L_short ** 2)
-    Es = 2.04e6  # 鋼筋彈性模數 kgf/cm²
+    Es = 2.04e6
 
     matrix = []
     earliest_safe_day = None
@@ -220,7 +215,6 @@ def calculate_single_case(params, case_name):
             
         phi_Vn = 0.75 * Vn
         
-        # 👇【請確認以下 (B) 與 (C) 兩段完整存在於 phi_Vn 與撓度計算之間】👇
         # (B) ACI 318-19 Table 22.5.5.1 樓版單向剪力容量 (100cm 寬無箍筋版帶)
         vc_slab_1way = 2.12 * lambda_s_slab * (rho_w_slab ** (1.0 / 3.0)) * math.sqrt(fci)
         vc_slab_1way = min(vc_slab_1way, 1.33 * math.sqrt(fci))
@@ -241,9 +235,8 @@ def calculate_single_case(params, case_name):
         vc_beam = vc_beam_stress * b_beam * d_beam
         Vs_beam = (Av_beam * fy * d_beam) / float(stirrup_space)
         phi_Vn_beam = 0.75 * (vc_beam + Vs_beam)
-        # 👆【補齊結束，下方緊接 ACI 318-19 標準撓度計算】👆
 
-        # 📌【ACI 318-19 第 24.2.4 節標準撓度計算 (區分活載重瞬時 ΔL 與持續載重徐變+乾縮 λΔ·Δsus)】
+        # (D) ACI 318-19 第 24.2.4 節雙軌撓度計算 + 施工變數保守調校 (v19.1)
         fr = 2.0 * math.sqrt(fci)
         Mcr = (fr * Ig_slab) / yt_slab
         
@@ -252,9 +245,12 @@ def calculate_single_case(params, case_name):
         k_cr = math.sqrt(2.0 * rho_n + (rho_n ** 2)) - rho_n
         Icr_slab = (100.0 * ((k_cr * d_slab) ** 3) / 3.0) + n_mod * As_per_meter * ((d_slab - k_cr * d_slab) ** 2)
 
+        k_irr_live = k_irr_heavy if case_name != "區域三：逆打地下一般平板 (常態無施工重載區)" else 1.20
+        
         w_dead_cm = w_dead / 10000.0
-        w_live_cm = w_live / 10000.0
-        w_sus_cm = w_dead_cm + 0.20 * w_live_cm  # 持續性載重 = 100%靜載重 + 20%持續施工堆置活載
+        w_live_eff_cm = (w_live * k_irr_live) / 10000.0
+        w_service_eff = w_dead_cm + w_live_eff_cm
+        w_sus_cm = w_dead_cm + 0.20 * w_live_eff_cm  # 持續性載重 = 100%靜載重 + 20%持續施工堆置活載
         
         # 1. 計算持續載重下的開裂有效慣性矩 Ie_sus (Bischoff 公式)
         Ma_sus = 0.065 * (w_sus_cm * 100.0) * (L_short ** 2)
@@ -265,33 +261,30 @@ def calculate_single_case(params, case_name):
             denom_sus = 1.0 - (ratio_m_sus ** 2) * (1.0 - (Icr_slab / Ig_slab))
             Ie_sus = min(Ig_slab, Icr_slab / max(0.1, denom_sus))
             
-        # 2. 計算全載重 (D+L) 下的開裂有效慣性矩 Ie_total (Bischoff 公式)
-        if Ma_slab <= (2.0 / 3.0) * Mcr:
+        Ma_total_eff = 0.065 * (w_service_eff * 100.0) * (L_short ** 2)
+        if Ma_total_eff <= (2.0 / 3.0) * Mcr:
             Ie_total = Ig_slab
         else:
-            ratio_m = ((2.0 / 3.0) * Mcr) / Ma_slab
+            ratio_m = ((2.0 / 3.0) * Mcr) / Ma_total_eff
             denom = 1.0 - (ratio_m ** 2) * (1.0 - (Icr_slab / Ig_slab))
             Ie_total = min(Ig_slab, Icr_slab / max(0.1, denom))
             
-        # 3. 計算各階段瞬時撓度 (樓版短向版帶 + 外圍大梁變位貢獻)
         Ig_beam = b_beam * (h_beam ** 3) / 12.0
-        Ie_beam = 0.55 * Ig_beam
+        Ie_beam = 0.45 * Ig_beam
         
         def calc_inst_deflection(w_load_cm, Ie_s):
-            d_slab_i = 0.0020 * (w_load_cm * 100.0 * (L_short ** 4)) / (Ec * Ie_s)
+            d_slab_i = alpha_slab_semi * (w_load_cm * 100.0 * (L_short ** 4)) / (Ec * Ie_s)
             w_trib_b = w_load_cm * (L_short / 2.0) * (1.0 - (L_short / (2.0 * L_long)))
             d_beam_i = 0.0026 * (w_trib_b * (L_long ** 4)) / (Ec * Ie_beam)
             d_tot_i = d_slab_i + 0.5 * d_beam_i
             return d_tot_i * 0.5 if "有下方支撐" in support_type else d_tot_i
 
         delta_D_inst = calc_inst_deflection(w_dead_cm, Ie_sus)
-        delta_DL_inst = calc_inst_deflection(w_service, Ie_total)
+        delta_DL_inst = calc_inst_deflection(w_service_eff, Ie_total)
         delta_sus_inst = calc_inst_deflection(w_sus_cm, Ie_sus)
         
-        # ACI 318-19 規定：純活載重瞬時撓度 ΔL = Δ(D+L) - ΔD
         delta_L_inst = max(0.0, delta_DL_inst - delta_D_inst)
         
-        # 4. ACI 318-19 Eq. 24.2.4.1.1 徐變 + 乾縮綜合乘數 λΔ = ξ / (1 + 50 * ρ')
         rho_prime = 0.5 * rho_w_slab
         if day <= 10:
             xi_factor = 2.4
@@ -301,14 +294,11 @@ def calculate_single_case(params, case_name):
             xi_factor = 2.0
             
         lambda_delta = xi_factor / (1.0 + 50.0 * rho_prime)
-        
-        # 長期附加撓度 (徐變 + 乾縮) 與 總增量撓度 (ΔL + λΔ * Δsus)
         delta_cp_sh = lambda_delta * delta_sus_inst
         delta_total_aci = delta_L_inst + delta_cp_sh
         
-        # 雙軌法規限值 (ACI 318-19 Table 24.2.2)
-        limit_L360 = L_long / 360.0   # 純活載重瞬時撓度限值
-        limit_L240 = L_long / 240.0   # 活載 + 徐變 + 乾縮 總撓度限值
+        limit_L360 = L_long / 360.0
+        limit_L240 = L_long / 240.0
         
         deflection_ok = (delta_L_inst <= limit_L360) and (delta_total_aci <= limit_L240)
 
@@ -390,8 +380,14 @@ def generate_cumulative_word_report(params, all_cases_results):
     
     cell_title_l = table_in.cell(0, 0)
     cell_title_r = table_in.cell(0, 1)
-    cell_title_l.paragraphs[0].add_run('基本工程參數項目').font.bold = True
-    cell_title_r.paragraphs[0].add_run('設計規範數值').font.bold = True
+    cell_title_l.text = '基本工程參數項目'
+    cell_title_r.text = '設計規範數值'
+    for p in cell_title_l.paragraphs:
+        for r in p.runs:
+            r.font.bold = True
+    for p in cell_title_r.paragraphs:
+        for r in p.runs:
+            r.font.bold = True
     set_cell_background(cell_title_l, "4F81BD")
     set_cell_background(cell_title_r, "4F81BD")
         
@@ -419,13 +415,14 @@ def generate_cumulative_word_report(params, all_cases_results):
         ("區域一(PC400)設定版厚", f"{params['h_case_1']} cm ({params['has_stirrup_1']})"),
         ("區域二(土車道)設定版厚", f"{params['h_case_2']} cm ({params['has_stirrup_2']})"),
         ("區域三(常態室)設定版厚", f"{params['h_case_3']} cm ({params['has_stirrup_3']})"),
-        ("外圍大樑專屬 Stirrups 配置", f"{params['stirrup_legs']}支 - #{params['stirrup_no']} @ {params['stirrup_space']} cm")
+        ("外圍大樑專屬 Stirrups 配置", f"{params['stirrup_legs']}支 - #{params['stirrup_no']} @ {params['stirrup_space']} cm"),
+        ("撓度保守調校參數", f"重載集中放大 K_irr = {params['k_irr_heavy']}，半剛性邊界 α = {params['alpha_slab_semi']}")
     ]
     
-    for item in inputs_list:
+    for k_text, v_text in inputs_list:
         row_cells = table_in.add_row().cells
-        row_cells[0].text = item[0]
-        row_cells[1].text = item[1]
+        for cell, val in zip(row_cells, (k_text, v_text)):
+            cell.text = val
         
     doc.add_paragraph("\n")
     doc.add_heading("二、 各施工分區拆模時間與多齡期核算矩陣", level=2)
@@ -440,24 +437,30 @@ def generate_cumulative_word_report(params, all_cases_results):
         
         for i, title_text in enumerate(headers):
             target_cell = table_out.cell(0, i)
-            run_out = target_cell.paragraphs[0].add_run(title_text)
-            run_out.font.bold = True
-            run_out.font.size = Pt(8.0)
+            target_cell.text = title_text
+            for p in target_cell.paragraphs:
+                for r in p.runs:
+                    r.font.bold = True
+                    r.font.size = Pt(8.0)
             set_cell_background(target_cell, "366092")
             
         for item in matrix:
+            row_vals = [
+                f"{item['thickness']}cm\n({int(item['wu_kgm2'])})",
+                f"{item['day']}天\n({item['pct_str']})",
+                f"{item['fci']}",
+                item['coeff_note'],
+                f"{item['phi_Vn']} / {item['Vu']}",
+                item['slab_1way'],
+                item['beam_1way'],
+                item['delta_info'],
+                item['limit'],
+                item['status'],
+                item['strategy']
+            ]
             row_cells = table_out.add_row().cells
-            row_cells[0].text = f"{item['thickness']}cm\n({int(item['wu_kgm2'])})"
-            row_cells[1].text = f"{item['day']}天\n({item['pct_str']})"
-            row_cells[2].text = f"{item['fci']}"
-            row_cells[3].text = item['coeff_note']
-            row_cells[4].text = f"{item['phi_Vn']} / {item['Vu']}"
-            row_cells[5].text = item['slab_1way']
-            row_cells[6].text = item['beam_1way']
-            row_cells[7].text = item['delta_info']
-            row_cells[8].text = item['limit']
-            row_cells[9].text = item['status']
-            row_cells[10].text = item['strategy']
+            for cell, val in zip(row_cells, row_vals):
+                cell.text = val
             
             if "禁止" in item['status']:
                 for cell in row_cells:
@@ -469,7 +472,7 @@ def generate_cumulative_word_report(params, all_cases_results):
         
     doc.add_heading("三、 ACI 318-19 雙軌撓度與抗剪規範說明", level=2)
     doc.add_paragraph(
-        f"""1. 撓度檢核嚴格遵循 ACI 318-19 第 24.2.4 節與 Table 24.2.2：區分「純活載重瞬時撓度 ΔL ≤ L/360」與「持續載重長期附加撓度（含徐變與乾縮，乘數 λΔ = ξ/(1+50ρ')）加上瞬時活載撓度 ΔL + λΔ·Δsus ≤ L/240」，並以 Bischoff 公式動態計算開裂有效慣性矩 Ie。
+        f"""1. 撓度檢核嚴格遵循 ACI 318-19 第 24.2.4 節與 Table 24.2.2：區分「純活載重瞬時撓度 ΔL ≤ L/360」與「持續載重長期附加撓度（含徐變與乾縮，乘數 λΔ = ξ/(1+50ρ')）加上瞬時活載撓度 ΔL + λΔ·Δsus ≤ L/240」。考量逆打施工階段變數與模型不規則性，版心撓度係數保守採用半剛性邊界值 α = 0.0032，重載區活載計入 1.5 倍集中放大係數（常態區 1.2 倍），外圍大梁開裂剛度採 0.45 Ig 計算。
         2. 各分區因數化荷重 Wu 隨樓版厚度（24 kgf/m²/cm + 100 kgf/m²）動態計算，並同步驅動雙向穿孔剪力、樓版單向剪力（1m寬板帶）與外圍大梁梯形負擔面積單向剪力。
         3. 現場實際拆模解鎖必須滿足：(1) 養護達 {min_days} 天；(2) 強度達 {min_ratio}% fc'；(3) 穿孔、板單剪、梁單剪皆合格；(4) 雙軌撓度皆小於規範限值。"""
     )
@@ -485,8 +488,8 @@ st.set_page_config(page_title="逆打施工平台拆模時間綜合分析APP (AC
 
 st.title("逆打施工平台與地下平板 ACI 318-19 拆模時間自動化系統")
 st.write(
-    """本系統已升級為【v18.0 全參數動態連動版】。
-各分區版厚與荷重即時連動「ACI 318-19 Bischoff 開裂慣性矩 Ie」、「樓版單向剪力（隨版厚變化）」與「大梁梯形負擔單向剪力（隨各區荷重變化）」，徹底消除固定常數。"""
+    """本系統已升級為【v19.1 實務保守調校定案版】。
+完整遵循 ACI 318-19 雙向穿孔、單向板/梁抗剪與雙軌撓度檢核（ΔL ≤ L/360 與 ΔL+徐變+乾縮 ≤ L/240），並納入施工不規則集中載重與半剛性邊界調校。"""
 )
 
 st.sidebar.header("結構工程與拆模管制參數面版")
@@ -515,8 +518,8 @@ with col_lb2:
     long_bar_space = st.selectbox("縱向鋼筋間距 (cm)", [10, 12, 15, 18, 20], index=2)
 
 st.sidebar.subheader("--- 四週外圍大樑專屬 Stirrups 配置 ---")
-stirrup_legs = st.sidebar.selectbox("A. 大梁箍筋配置肢數 (Legs)", [2, 3, 4], index=0) 
-stirrup_no = st.sidebar.selectbox("B. 大梁箍筋鋼筋號數 (Bar No.)", [3, 4, 5], index=1)   
+stirrup_legs = st.sidebar.selectbox("A. 大梁箍筋配置肢數 (Legs)", [2, 4], index=0) 
+stirrup_no = st.sidebar.selectbox("B. 大梁箍筋鋼筋號數 (Bar No.)", [3, 4], index=1)   
 stirrup_space = st.sidebar.selectbox("C. 大梁箍筋綁紮間距 (Spacing cm)", [10, 12, 15, 20], index=0) 
 
 st.sidebar.subheader("--- 柱頭幾何型式與尺寸 ---")
@@ -544,10 +547,14 @@ st.sidebar.subheader("--- 區域三：常態地下室獨立變數 ---")
 h_case_3 = st.sidebar.slider("3-A. 區域三 樓版厚度 (cm)", 20, 60, 40)
 has_stirrup_3 = st.sidebar.selectbox("3-B. 區域三 版內暗樑剪力補強", ["無版內剪力筋 (ACI 318-19 Table 22.6.5.2)", "配置柱頭暗樑剪力筋 (隨大梁箍筋連動)"], index=0)
 
+st.sidebar.subheader("--- 施工不規則與撓度保守調校 ---")
+k_irr_heavy = st.sidebar.slider("重載區集中與不規則放大係數 (K_irr)", 1.0, 2.0, 1.5, step=0.1)
+alpha_slab_semi = st.sidebar.slider("版心半剛性邊界撓度係數 (α)", 0.0020, 0.0045, 0.0032, step=0.0002, format="%.4f")
+
 st.sidebar.subheader("--- 基礎材料與網格幾何參數 ---")
 t_steel = st.sidebar.selectbox("1. 鋪設鋼板基本厚度 PL (mm)", [12, 16, 19, 22], index=0)
 fc = st.sidebar.selectbox("2. 混凝土 28天設計強度 fc' (kgf/cm²)", [280, 350, 420], index=1)
-fy = st.sidebar.selectbox("3. 鋼筋屈服強度 fy (kgf/cm²)", [2800, 4200, 4900], index=1)
+fy = st.sidebar.selectbox("3. 鋼筋屈服強度 fy (kgf/cm²)", [2800, 4200], index=1)
 
 support_type = st.sidebar.selectbox("4. 施工支撐壓力傳遞模式", [
     "逆打工法完全懸空模式 (無下方支撐/傳遞)", 
@@ -574,6 +581,8 @@ params = {
     'support_type': support_type, 't_steel': t_steel, 
     'min_fc_ratio': min_fc_ratio,
     'min_days_req': min_days_req,
+    'k_irr_heavy': k_irr_heavy,
+    'alpha_slab_semi': alpha_slab_semi,
     'stirrup_legs': stirrup_legs, 'stirrup_no': stirrup_no, 'stirrup_space': stirrup_space,
     'deck_mode_1': deck_mode_1,
     'h_case_1': h_case_1, 'has_stirrup_1': has_stirrup_1,
@@ -594,9 +603,9 @@ for case in cases_list:
 for case_name, (matrix, earliest_day) in all_cases_results.items():
     st.subheader(f"分析分區: {case_name}")
     if earliest_day:
-        st.success(f"⏱️ **系統精算建議：本區最早可安全拆模（開挖）時間為【第 {earliest_day} 天】**（已滿足規範最少 {min_days_req} 天、強度 ≥ {min_fc_ratio}% fc'、雙向穿孔、板/梁單剪與開裂撓度死線）")
+        st.success(f"⏱️ **系統精算建議：本區最早可安全拆模（開挖）時間為【第 {earliest_day} 天】**（已滿足規範最少 {min_days_req} 天、強度 ≥ {min_fc_ratio}% fc'、雙向穿孔、板/梁單剪與雙軌撓度死線）")
     else:
-        st.error("⚠️ **系統精算警告：本區在 28 天內均未同時滿足規範天數、強度與開裂撓度死線，必須維持原狀土模或立設滿堂重型回撐！**")
+        st.error("⚠️ **系統精算警告：本區在 28 天內均未同時滿足規範天數、強度與雙軌撓度死線，必須維持原狀土模或立設滿堂重型回撐！**")
     
     display_data = []
     for r in matrix:
@@ -608,8 +617,8 @@ for case_name, (matrix, earliest_day) in all_cases_results.items():
             "穿孔剪力 容量/需求 (T)": f"{r['phi_Vn']} / {r['Vu']}",
             "板單向剪力 容量/需求 (T/m)": r['slab_1way'],
             "大梁單剪 容量/需求 (T)": r['beam_1way'],
-            "總撓度(cm) [Bischoff Ie]": r['delta_info'],
-            "限值 L/240": r['limit'],
+            "雙軌撓度(cm) [ΔL | 總撓度]": r['delta_info'],
+            "雙軌限值 L/360 | L/240": r['limit'],
             "拆模判定": r['status'],
             "施工管制與未達標原因說明": r['strategy']
         })
